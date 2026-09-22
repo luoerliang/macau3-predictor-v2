@@ -1,117 +1,212 @@
-import os, re, sqlite3, threading, time
-from datetime import datetime, timezone
+
+import os, re, sqlite3, threading, time, json
+from datetime import datetime
+from collections import Counter
 from flask import Flask, jsonify, render_template_string
 import requests
 from bs4 import BeautifulSoup
-from collections import Counter
 
 app = Flask(__name__)
-DB = "draws.db"
-SOURCE = "https://macaujc.com/open_video3/"
+DB = os.path.join(os.path.dirname(__file__), "draws.db")
 
-HTML = r"""<!doctype html><html lang="zh-CN"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+SOURCE_URLS = [
+    "https://macaujc.com/open_video3/",
+    "https://macaujc.com/macaujc3/",
+]
+READER_URLS = [
+    "https://r.jina.ai/https://macaujc.com/open_video3/",
+    "https://r.jina.ai/https://macaujc.com/macaujc3/",
+]
+UA = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1"
+HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+
+HTML = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>澳门六合彩3分分析</title>
 <style>
-body{margin:0;background:#f5f5f7;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#222}
-main{max-width:760px;margin:auto;padding:16px}.card{background:#fff;border-radius:18px;padding:18px;margin:12px 0;box-shadow:0 2px 12px #0001}
-h1{margin:0 0 5px;font-size:24px}.muted{color:#777;font-size:13px}.balls{display:flex;flex-wrap:wrap;gap:8px}.ball{width:42px;height:42px;border-radius:50%;display:grid;place-items:center;background:#eee;font-weight:700}
-button{background:#111;color:#fff;border:0;border-radius:12px;padding:11px 15px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}.big{font-size:22px;font-weight:700}
-table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:8px;border-bottom:1px solid #eee;text-align:left}
-.notice{background:#fff7dc;padding:12px;border-radius:12px;font-size:13px}
-</style></head><body><main>
-<div class="card"><h1>🎯 澳门六合彩3分分析</h1><div class="muted">自动同步 · 统计 · 历史回测（原型）</div><p><button onclick="sync()">立即同步</button> <span id="status"></span></p></div>
-<div class="card"><h2>最新开奖</h2><div id="latest">加载中…</div></div>
-<div class="card"><h2>📊 统计候选</h2><div class="notice">以下为历史频率评分，不是中奖概率，也不保证下一期结果。</div><p id="cand">加载中…</p></div>
-<div class="card"><h2>历史记录</h2><div style="overflow:auto"><table><thead><tr><th>期号</th><th>时间</th><th>正码</th><th>特码</th></tr></thead><tbody id="history"></tbody></table></div></div>
-</main>
+*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:auto;padding:16px}.hero{background:#111827;color:#fff;border-radius:20px;padding:20px}
+h1{font-size:24px;margin:0 0 7px}.sub{opacity:.78;font-size:13px;line-height:1.6}.btn{margin-top:14px;border:0;border-radius:12px;padding:12px 16px;background:#fff;color:#111827;font-size:15px;font-weight:700}
+.card{background:#fff;border-radius:18px;padding:16px;margin-top:12px;box-shadow:0 3px 14px #0000000a}.title{font-weight:800;margin-bottom:10px}.muted{color:#6b7280;font-size:13px}
+.latest{font-size:18px;font-weight:800}.nums{display:flex;gap:7px;flex-wrap:wrap;margin-top:10px}.ball{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:#eef2ff;font-weight:800}
+table{width:100%;border-collapse:collapse;font-size:13px}td,th{padding:9px 4px;border-bottom:1px solid #edf0f5;text-align:left}th{color:#6b7280}.tag{display:inline-block;background:#f0fdf4;border-radius:9px;padding:5px 8px;margin:3px;font-weight:700}.status{margin-top:10px;font-size:13px;line-height:1.5}
+</style></head><body><div class="wrap">
+<div class="hero"><h1>🎯 澳门六合彩3分分析</h1><div class="sub">自动同步 · 历史统计 · 简单回测<br>数据源固定为“澳门六合彩3分”，不混入普通澳门六合彩。</div>
+<button class="btn" onclick="sync()">立即同步</button><div id="status" class="status">准备就绪</div></div>
+<div class="card"><div class="title">最新开奖</div><div id="latest" class="muted">加载中…</div></div>
+<div class="card"><div class="title">统计候选</div><div class="muted">按历史出现次数排序，仅作统计参考，不代表下一期概率。</div><div id="scores">加载中…</div></div>
+<div class="card"><div class="title">最近50期</div><div style="overflow:auto"><table><thead><tr><th>期号</th><th>开奖时间</th><th>号码</th></tr></thead><tbody id="history"></tbody></table></div></div>
+</div>
 <script>
 async function load(){
- const d=await (await fetch('/api/data')).json();
- if(!d.draws.length){document.getElementById('latest').textContent='暂未抓到数据';return}
- const x=d.draws[0];
- document.getElementById('latest').innerHTML=`<div class="grid"><div><div class="muted">期号</div><div class="big">${x.issue}</div></div><div><div class="muted">开奖时间</div>${x.time}</div></div><p>正码</p><div class="balls">${x.main.map(n=>`<span class="ball">${String(n).padStart(2,'0')}</span>`).join('')}</div><p>特码</p><div class="balls"><span class="ball">${String(x.special).padStart(2,'0')}</span></div>`;
- document.getElementById('cand').innerHTML=d.scores.slice(0,10).map(x=>`<span class="ball" style="display:inline-grid;margin:3px">${String(x.n).padStart(2,'0')}</span>`).join('');
- document.getElementById('history').innerHTML=d.draws.slice(0,50).map(x=>`<tr><td>${x.issue}</td><td>${x.time}</td><td>${x.main.map(n=>String(n).padStart(2,'0')).join(' ')}</td><td>${String(x.special).padStart(2,'0')}</td></tr>`).join('');
+ try{const r=await fetch('/api/data');const d=await r.json();
+ let x=d.draws||[];
+ document.getElementById('latest').innerHTML=x.length?`第${x[0].issue}期 · ${x[0].time}<div class="nums">${x[0].numbers.map(n=>`<span class="ball">${String(n).padStart(2,'0')}</span>`).join('')}</div>`:'暂未抓到数据';
+ document.getElementById('scores')=(d.scores||[]).map(x=>`<span class="tag">${String(x[0]).padStart(2,'0')} · ${x[1]}次</span>`).join('')||'暂无统计';
+ document.getElementById('history').innerHTML=x.map(r=>`<tr><td>${r.issue}</td><td>${r.time}</td><td>${r.numbers.map(n=>String(n).padStart(2,'0')).join(' ')}</td></tr>`).join('');
+ }catch(e){document.getElementById('status').textContent='读取失败：'+e}
 }
-async function sync(){document.getElementById('status').textContent='同步中…';let r=await fetch('/api/sync');let d=await r.json();document.getElementById('status').textContent=d.ok?`已解析 ${d.parsed} 条`:`失败：${d.error}`;load()}
-load();setInterval(load,30000);
+async function sync(){
+ const s=document.getElementById('status');s.textContent='正在同步澳门六合彩3分数据…';
+ try{const r=await fetch('/api/sync');const d=await r.json();s.textContent=d.ok?`同步完成：本次解析 ${d.parsed} 条，数据库共 ${d.total} 条。${d.source?'来源：'+d.source:''}`:'同步失败：'+(d.error||'未知错误');await load()}catch(e){s.textContent='同步失败：'+e}
+}
+load(); setInterval(load,30000);
 </script></body></html>"""
 
-def conn():
-    c=sqlite3.connect(DB)
-    c.execute("""CREATE TABLE IF NOT EXISTS draws(
-      issue TEXT PRIMARY KEY, draw_time TEXT,
-      n1 INTEGER,n2 INTEGER,n3 INTEGER,n4 INTEGER,n5 INTEGER,n6 INTEGER,
-      special INTEGER, fetched_at TEXT)""")
-    c.commit()
-    return c
+def init_db():
+    with sqlite3.connect(DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS draws(
+            issue TEXT PRIMARY KEY,
+            draw_time TEXT NOT NULL,
+            numbers TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""")
+        c.commit()
 
-def parse():
-    r=requests.get(SOURCE,headers={"User-Agent":"Mozilla/5.0"},timeout=20)
+def clean_issue(x):
+    m = re.search(r"\d{8,}", str(x))
+    return m.group(0) if m else None
+
+def clean_numbers(value):
+    if isinstance(value, list):
+        raw = value
+    else:
+        raw = re.findall(r"(?<!\d)(?:0?[1-9]|[1-4]\d)(?!\d)", str(value))
+    nums = []
+    for x in raw:
+        try:
+            n = int(x)
+            if 1 <= n <= 49:
+                nums.append(n)
+        except:
+            pass
+    return nums[:7] if len(nums) >= 7 else None
+
+def add_record(found, issue, draw_time, numbers):
+    issue = clean_issue(issue)
+    numbers = clean_numbers(numbers)
+    if not issue or not draw_time or not numbers or len(numbers) != 7:
+        return
+    # 3分彩期号通常为11位；不强制长度，兼容站点调整。
+    found[issue] = (issue, str(draw_time).strip(), numbers)
+
+def parse_structured(text, found):
+    # 兼容页面里可能嵌入的 JSON 数据
+    for m in re.finditer(r'["\']expect["\']\s*:\s*["\'](\d{8,})["\'].*?["\']openCode["\']\s*:\s*["\']([^"\']+)["\'].*?["\']openTime["\']\s*:\s*["\']([^"\']+)["\']', text, re.S):
+        add_record(found, m.group(1), m.group(3), m.group(2))
+
+def parse_text(text, found):
+    text = text.replace("\xa0"," ")
+    # 每个“第XXXX期”到下一期之间，找日期后的7个号码。
+    matches = list(re.finditer(r"第\s*(\d{8,})\s*期", text))
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i+1].start() if i+1 < len(matches) else min(len(text), start+2500)
+        block = text[start:end]
+        dt = re.search(r"(20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?)", block)
+        if not dt:
+            continue
+        after = block[dt.end():]
+        # 截断到明显的下一段说明，减少把其他数字带进来
+        nums = re.findall(r"(?<!\d)(0?[1-9]|[1-4]\d)(?!\d)", after)
+        nums = [int(x) for x in nums[:7]]
+        if len(nums) == 7:
+            add_record(found, m.group(1), dt.group(1), nums)
+
+def parse_html(raw, found):
+    soup = BeautifulSoup(raw, "html.parser")
+    parse_structured(raw, found)
+    parse_text(" ".join(soup.stripped_strings), found)
+    parse_text(soup.get_text(" ", strip=True), found)
+
+def fetch(url):
+    r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
-    soup=BeautifulSoup(r.text,"html.parser")
-    text=" ".join(soup.stripped_strings)
-    pat=re.compile(r"第\s*(20\d{7,})\s*期\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
-    found=[]
-    positions=[m for m in pat.finditer(text)]
-    for i,m in enumerate(positions):
-        block=text[m.end():positions[i+1].start() if i+1<len(positions) else m.end()+500]
-        nums=[int(x) for x in re.findall(r"(?<!\d)(0?[1-9]|[1-4]\d)(?!\d)",block)]
-        if len(nums)>=7:
-            found.append((m.group(1),m.group(2),nums[:7]))
-    return found
+    return r.text
+
+def collect():
+    found = {}
+    errors = []
+    for url in SOURCE_URLS:
+        try:
+            raw = fetch(url)
+            parse_html(raw, found)
+            if len(found) >= 5:
+                return found, url, errors
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    # 动态页面兜底：使用只读网页转文本服务，不改变数据源。
+    for url in READER_URLS:
+        try:
+            raw = fetch(url)
+            parse_text(raw, found)
+            parse_structured(raw, found)
+            if len(found) >= 5:
+                return found, url, errors
+        except Exception as e:
+            errors.append(f"{url}: {e}")
+    return found, "", errors
+
+def save(found):
+    now = datetime.utcnow().isoformat(timespec="seconds")
+    with sqlite3.connect(DB) as c:
+        for issue, dt, nums in found.values():
+            c.execute("INSERT OR REPLACE INTO draws(issue,draw_time,numbers,updated_at) VALUES(?,?,?,?)",
+                      (issue, dt, json.dumps(nums, ensure_ascii=False), now))
+        c.commit()
+        total = c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+    return total
 
 def sync():
+    found, source, errors = collect()
+    total = save(found) if found else count_rows()
+    return found, source, errors, total
+
+def count_rows():
+    with sqlite3.connect(DB) as c:
+        return c.execute("SELECT COUNT(*) FROM draws").fetchone()[0]
+
+def rows(limit=100):
+    with sqlite3.connect(DB) as c:
+        data = c.execute("SELECT issue,draw_time,numbers FROM draws ORDER BY draw_time DESC, issue DESC LIMIT ?", (limit,)).fetchall()
+    return [{"issue":a,"time":b,"numbers":json.loads(c)} for a,b,c in data]
+
+def score_data():
+    rs = rows(100)
+    counter = Counter()
+    for r in rs:
+        counter.update(r["numbers"])
+    return sorted(counter.items(), key=lambda x:(-x[1], x[0]))[:12]
+
+@app.route("/")
+def index():
+    return render_template_string(HTML)
+
+@app.route("/api/data")
+def api_data():
+    return jsonify({"draws":rows(100), "scores":score_data(), "count":count_rows()})
+
+@app.route("/api/sync")
+def api_sync():
     try:
-        rows=parse()
-        c=conn()
-        for issue,dt,ns in rows:
-            c.execute("""INSERT OR REPLACE INTO draws
-              VALUES(?,?,?,?,?,?,?,?,?,?)""",
-              (issue,dt,*ns,datetime.now(timezone.utc).isoformat()))
-        c.commit(); c.close()
-        return len(rows),None
+        found, source, errors, total = sync()
+        if not found:
+            return jsonify({"ok":False,"parsed":0,"total":total,
+                            "error":"没有解析到澳门六合彩3分数据。请稍后再试。","details":errors}), 502
+        return jsonify({"ok":True,"parsed":len(found),"total":total,"source":source})
     except Exception as e:
-        return 0,str(e)
-
-def data():
-    c=conn()
-    rows=c.execute("SELECT issue,draw_time,n1,n2,n3,n4,n5,n6,special FROM draws ORDER BY issue DESC").fetchall()
-    c.close()
-    return rows
-
-def scores(rows):
-    c=Counter()
-    for row in rows[:100]:
-        c.update(row[2:9])
-    return sorted([(n,c[n]) for n in range(1,50)], key=lambda x:(-x[1],x[0]))
+        return jsonify({"ok":False,"parsed":0,"total":count_rows(),"error":str(e)}), 500
 
 def background():
     while True:
-        sync()
+        try:
+            sync()
+        except Exception:
+            pass
         time.sleep(45)
 
-@app.get("/")
-def home():
-    return render_template_string(HTML)
-
-@app.get("/api/sync")
-def api_sync():
-    n,e=sync()
-    return jsonify({"ok":e is None,"parsed":n,"error":e})
-
-@app.get("/api/data")
-def api_data():
-    rows=data()
-    s=scores(rows)
-    out=[]
-    for r in rows:
-        out.append({"issue":r[0],"time":r[1],"main":list(r[2:8]),"special":r[8]})
-    return jsonify({"draws":out,"scores":[{"n":n,"score":v} for n,v in s]})
-
-threading.Thread(target=background,daemon=True).start()
+init_db()
+threading.Thread(target=background, daemon=True).start()
 
 if __name__ == "__main__":
-    port=int(os.environ.get("PORT","5000"))
-    app.run(host="0.0.0.0",port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
