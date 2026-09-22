@@ -42,7 +42,7 @@ async function load(){
  try{const r=await fetch('/api/data');const d=await r.json();
  let x=d.draws||[];
  document.getElementById('latest').innerHTML=x.length?`第${x[0].issue}期 · ${x[0].time}<div class="nums">${x[0].numbers.map(n=>`<span class="ball">${String(n).padStart(2,'0')}</span>`).join('')}</div>`:'暂未抓到数据';
- document.getElementById('scores')=(d.scores||[]).map(x=>`<span class="tag">${String(x[0]).padStart(2,'0')} · ${x[1]}次</span>`).join('')||'暂无统计';
+ document.getElementById('scores').innerHTML=(d.scores||[]).map(x=>`<span class="tag">${String(x[0]).padStart(2,'0')} · ${x[1]}次</span>`).join('')||'暂无统计';
  document.getElementById('history').innerHTML=x.map(r=>`<tr><td>${r.issue}</td><td>${r.time}</td><td>${r.numbers.map(n=>String(n).padStart(2,'0')).join(' ')}</td></tr>`).join('');
  }catch(e){document.getElementById('status').textContent='读取失败：'+e}
 }
